@@ -63,7 +63,7 @@ async def openai_chat_completions(
         # Handle streaming response
         async def openai_stream_generator():
             try:
-                response = await google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=True)
+                response = google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=True)
                 
                 if isinstance(response, StreamingResponse):
                     response_id = "chatcmpl-" + str(uuid.uuid4())
@@ -181,7 +181,7 @@ async def openai_chat_completions(
     else:
         # Handle non-streaming response
         try:
-            response = await google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=False)
+            response = google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=False)
             
             if isinstance(response, Response) and response.status_code != 200:
                 # Handle error responses from Google API
@@ -232,19 +232,16 @@ async def openai_chat_completions(
                         async def openai_keepalive_wrapper():
                             gemini_response = None
                             async for chunk in response.body_iterator:
-                                chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else chunk
-                                
-                                if chunk_str == "\n":
+                                if chunk == "\n":
                                     yield "\n"
                                 else:
                                     try:
-                                        gemini_response = json.loads(chunk_str)
+                                        gemini_response = json.loads(chunk) if isinstance(chunk, str) else json.loads(chunk.decode('utf-8'))
                                         openai_response = gemini_response_to_openai(gemini_response, request.model)
                                         yield json.dumps(openai_response, ensure_ascii=False)
                                     except (json.JSONDecodeError, Exception) as e:
                                         logging.error(f"Failed to convert response: {str(e)}")
-                                        yield chunk_str
-                            return
+                                        yield chunk
                         
                         return StreamingResponse(
                             openai_keepalive_wrapper(),
@@ -256,8 +253,8 @@ async def openai_chat_completions(
                                 "Access-Control-Allow-Headers": "*",
                             }
                         )
-                
-                gemini_response = json.loads(response.body)
+                else:
+                    gemini_response = json.loads(response.body)
                 
                 openai_response = gemini_response_to_openai(gemini_response, request.model)
                 
@@ -353,3 +350,5 @@ async def openai_list_models(username: str = Depends(authenticate_user)):
             status_code=500,
             media_type="application/json"
         )
+
+
