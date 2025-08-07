@@ -63,7 +63,7 @@ async def openai_chat_completions(
         # Handle streaming response
         async def openai_stream_generator():
             try:
-                response = google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=True)
+                response = await google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=True)
                 
                 if isinstance(response, StreamingResponse):
                     response_id = "chatcmpl-" + str(uuid.uuid4())
@@ -181,7 +181,9 @@ async def openai_chat_completions(
     else:
         # Handle non-streaming response
         try:
-            response = google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=False)
+            response = await google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=False)
+            gemini_response = None
+            openai_response = None
             
             if isinstance(response, Response) and response.status_code != 200:
                 # Handle error responses from Google API
@@ -236,7 +238,9 @@ async def openai_chat_completions(
                                     yield "\n"
                                 else:
                                     try:
-                                        gemini_response = json.loads(chunk) if isinstance(chunk, str) else json.loads(chunk.decode('utf-8'))
+                                        if isinstance(chunk, bytes):
+                                            chunk = chunk.decode('utf-8')
+                                        gemini_response = json.loads(chunk)
                                         openai_response = gemini_response_to_openai(gemini_response, request.model)
                                         yield json.dumps(openai_response, ensure_ascii=False)
                                     except (json.JSONDecodeError, Exception) as e:
@@ -256,10 +260,25 @@ async def openai_chat_completions(
                 else:
                     gemini_response = json.loads(response.body)
                 
-                openai_response = gemini_response_to_openai(gemini_response, request.model)
+                if gemini_response:
+                    openai_response = gemini_response_to_openai(gemini_response, request.model)
                 
                 logging.info(f"Successfully processed non-streaming response for model: {request.model}")
-                return openai_response
+                if openai_response:
+                    return openai_response
+                else:
+                    # Fallback to an empty response if openai_response is not set
+                    return Response(
+                        content=json.dumps({
+                            "error": {
+                                "message": "Empty response from model",
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }),
+                        status_code=500,
+                        media_type="application/json"
+                    )
                 
             except (json.JSONDecodeError, AttributeError, Exception) as e:
                 logging.error(f"Failed to parse Gemini response: {str(e)}")
@@ -350,5 +369,3 @@ async def openai_list_models(username: str = Depends(authenticate_user)):
             status_code=500,
             media_type="application/json"
         )
-
-

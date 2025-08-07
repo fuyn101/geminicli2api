@@ -39,7 +39,7 @@ class GoogleApiClient:
         """Makes the actual HTTP request with retry mechanism."""
         return requests.post(url, data=data, headers=headers, stream=stream)
 
-    def send_request(self, payload: dict, creds, project_id, is_streaming: bool = False) -> Response:
+    async def send_request(self, payload: dict, creds, project_id, is_streaming: bool = False) -> Response:
         """
         Send a request to Google's Gemini API using the provided credentials.
         
@@ -98,13 +98,18 @@ class GoogleApiClient:
 
         # Send the request
         try:
+            loop = asyncio.get_event_loop()
             if is_streaming:
                 if use_pseudo_streaming:
                     # For pseudo-streaming models, use pseudo-streaming mode
                     return self._handle_pseudo_streaming(target_url, final_post_data, request_headers)
                 else:
                     # For normal streaming models, use true streaming
-                    resp = self._make_request(target_url, final_post_data, request_headers, stream=True)
+                    resp = await loop.run_in_executor(
+                        None,
+                        self._make_request,
+                        target_url, final_post_data, request_headers, True
+                    )
                     return self._handle_streaming_response(resp)
             else:
                 # For non-streaming requests, check if keepalive is enabled
@@ -114,7 +119,11 @@ class GoogleApiClient:
                     return self._handle_nonstream_keepalive(target_url, final_post_data, request_headers)
                 else:
                     # Normal non-streaming mode
-                    resp = self._make_request(target_url, final_post_data, request_headers)
+                    resp = await loop.run_in_executor(
+                        None,
+                        self._make_request,
+                        target_url, final_post_data, request_headers, False
+                    )
                     return self._handle_non_streaming_response(resp)
         except requests.exceptions.RequestException as e:
             logging.error(f"Request to Google API failed after retries: {str(e)}")
@@ -677,18 +686,14 @@ class GoogleApiClient:
                 media_type=resp.headers.get("Content-Type")
             )
 
-# Singleton instance
-google_api_client = None
-
+# google_api_client instance is now managed by FastAPI's dependency injection per-request
 def get_google_api_client():
     """
-    Lazily initializes and returns the singleton GoogleApiClient instance.
+    Returns a new instance of the GoogleApiClient for each request.
+    This ensures that each request has its own client, preventing potential
+    concurrency issues that might arise from a shared client instance.
     """
-    global google_api_client
-    if google_api_client is None:
-        # First request: Initializing Google API client...
-        google_api_client = GoogleApiClient()
-    return google_api_client
+    return GoogleApiClient()
 
 def build_gemini_payload_from_openai(openai_payload: dict) -> dict:
     """
