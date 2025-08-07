@@ -118,7 +118,7 @@ async def gemini_proxy(
         gemini_payload = build_gemini_payload_from_native(incoming_request, model_name)
         
         # Send the request to Google API
-        response = google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=is_streaming)
+        response = await google_api_client.send_request(gemini_payload, creds=creds, project_id=project_id, is_streaming=is_streaming)
         
         # Log the response status
         if hasattr(response, 'status_code'):

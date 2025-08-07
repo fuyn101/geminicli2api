@@ -5,7 +5,7 @@ import time
 import logging
 import threading
 import glob
-import requests
+import httpx
 from multiprocessing import Value, Lock, Manager
 from datetime import datetime, timedelta
 from fastapi import Request, HTTPException, Depends
@@ -300,7 +300,7 @@ def get_credentials():
     # No valid credentials found.
     return None, None, None
 
-def onboard_user(creds, project_id, file_path):
+async def onboard_user(creds, project_id, file_path):
     """
     Ensures the user is onboarded for a specific credential, matching gemini-cli setupUser behavior.
     This check is now process-safe and specific to each credential file.
@@ -328,66 +328,67 @@ def onboard_user(creds, project_id, file_path):
     }
     
     try:
-        resp = requests.post(
-            f"{CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist",
-            data=json.dumps(load_assist_payload),
-            headers=headers,
-        )
-        resp.raise_for_status()
-        load_data = resp.json()
-        
-        tier = None
-        if load_data.get("currentTier"):
-            tier = load_data["currentTier"]
-        else:
-            for allowed_tier in load_data.get("allowedTiers", []):
-                if allowed_tier.get("isDefault"):
-                    tier = allowed_tier
-                    break
-            
-            if not tier:
-                tier = {
-                    "name": "",
-                    "description": "",
-                    "id": "legacy-tier",
-                    "userDefinedCloudaicompanionProject": True,
-                }
-
-        if tier.get("userDefinedCloudaicompanionProject") and not project_id:
-            raise ValueError("This account requires setting the GOOGLE_CLOUD_PROJECT env var.")
-
-        if load_data.get("currentTier"):
-            status_dict[file_path] = True
-            return
-
-        onboard_req_payload = {
-            "tierId": tier.get("id"),
-            "cloudaicompanionProject": project_id,
-            "metadata": get_client_metadata(creds, project_id),
-        }
-
-        while True:
-            onboard_resp = requests.post(
-                f"{CODE_ASSIST_ENDPOINT}/v1internal:onboardUser",
-                data=json.dumps(onboard_req_payload),
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist",
+                content=json.dumps(load_assist_payload),
                 headers=headers,
             )
-            onboard_resp.raise_for_status()
-            lro_data = onboard_resp.json()
-
-            if lro_data.get("done"):
-                status_dict[file_path] = True # Mark this credential as successfully onboarded
-                break
+            resp.raise_for_status()
+            load_data = resp.json()
             
-            time.sleep(5)
+            tier = None
+            if load_data.get("currentTier"):
+                tier = load_data["currentTier"]
+            else:
+                for allowed_tier in load_data.get("allowedTiers", []):
+                    if allowed_tier.get("isDefault"):
+                        tier = allowed_tier
+                        break
+                
+                if not tier:
+                    tier = {
+                        "name": "",
+                        "description": "",
+                        "id": "legacy-tier",
+                        "userDefinedCloudaicompanionProject": True,
+                    }
 
-    except requests.exceptions.HTTPError as e:
+            if tier.get("userDefinedCloudaicompanionProject") and not project_id:
+                raise ValueError("This account requires setting the GOOGLE_CLOUD_PROJECT env var.")
+
+            if load_data.get("currentTier"):
+                status_dict[file_path] = True
+                return
+
+            onboard_req_payload = {
+                "tierId": tier.get("id"),
+                "cloudaicompanionProject": project_id,
+                "metadata": get_client_metadata(creds, project_id),
+            }
+
+            while True:
+                onboard_resp = await client.post(
+                    f"{CODE_ASSIST_ENDPOINT}/v1internal:onboardUser",
+                    content=json.dumps(onboard_req_payload),
+                    headers=headers,
+                )
+                onboard_resp.raise_for_status()
+                lro_data = onboard_resp.json()
+
+                if lro_data.get("done"):
+                    status_dict[file_path] = True # Mark this credential as successfully onboarded
+                    break
+                
+                time.sleep(5)
+
+    except httpx.HTTPStatusError as e:
         raise Exception(f"User onboarding failed. Please check your Google Cloud project permissions and try again. Error: {e.response.text if hasattr(e, 'response') else str(e)}")
     except Exception as e:
         raise Exception(f"User onboarding failed due to an unexpected error: {str(e)}")
 
 
-def get_current_session():
+async def get_current_session():
     """
     A FastAPI dependency that provides a fresh, rotated credential session for each request.
     It will attempt to get a working credential up to 3 times before failing.
@@ -403,7 +404,7 @@ def get_current_session():
 
             # Ensure user is onboarded for this specific credential.
             # This might raise an exception, which is a failed attempt.
-            onboard_user(creds, project_id, file_path)
+            await onboard_user(creds, project_id, file_path)
             
             # If onboard_user succeeds, we have a working credential.
             return creds, project_id

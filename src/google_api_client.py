@@ -4,7 +4,7 @@ This module is used by both OpenAI compatibility layer and native Gemini endpoin
 """
 import json
 import logging
-import requests
+import httpx
 import asyncio
 import time
 from fastapi import Response
@@ -35,11 +35,14 @@ class GoogleApiClient:
         pass
 
     @retry_api_call(retries=3, delay=1)
-    def _make_request(self, url, data, headers, stream=False):
+    async def _make_request(self, client: httpx.AsyncClient, url, data, headers, stream=False):
         """Makes the actual HTTP request with retry mechanism."""
-        return requests.post(url, data=data, headers=headers, stream=stream)
+        if stream:
+            # Use a longer timeout for streaming requests
+            return await client.post(url, data=data, headers=headers, timeout=300.0)
+        return await client.post(url, data=data, headers=headers)
 
-    def send_request(self, payload: dict, creds, project_id, is_streaming: bool = False) -> Response:
+    async def send_request(self, payload: dict, creds, project_id, is_streaming: bool = False) -> Response:
         """
         Send a request to Google's Gemini API using the provided credentials.
         
@@ -98,25 +101,26 @@ class GoogleApiClient:
 
         # Send the request
         try:
-            if is_streaming:
-                if use_pseudo_streaming:
-                    # For pseudo-streaming models, use pseudo-streaming mode
-                    return self._handle_pseudo_streaming(target_url, final_post_data, request_headers)
+            async with httpx.AsyncClient() as client:
+                if is_streaming:
+                    if use_pseudo_streaming:
+                        # For pseudo-streaming models, use pseudo-streaming mode
+                        return await self._handle_pseudo_streaming(client, target_url, final_post_data, request_headers)
+                    else:
+                        # For normal streaming models, use true streaming
+                        resp = await self._make_request(client, target_url, final_post_data, request_headers, stream=True)
+                        return await self._handle_streaming_response(resp)
                 else:
-                    # For normal streaming models, use true streaming
-                    resp = self._make_request(target_url, final_post_data, request_headers, stream=True)
-                    return self._handle_streaming_response(resp)
-            else:
-                # For non-streaming requests, check if keepalive is enabled
-                from .config import NONSTREAM_KEEPALIVE_ENABLED
-                
-                if NONSTREAM_KEEPALIVE_ENABLED:
-                    return self._handle_nonstream_keepalive(target_url, final_post_data, request_headers)
-                else:
-                    # Normal non-streaming mode
-                    resp = self._make_request(target_url, final_post_data, request_headers)
-                    return self._handle_non_streaming_response(resp)
-        except requests.exceptions.RequestException as e:
+                    # For non-streaming requests, check if keepalive is enabled
+                    from .config import NONSTREAM_KEEPALIVE_ENABLED
+                    
+                    if NONSTREAM_KEEPALIVE_ENABLED:
+                        return await self._handle_nonstream_keepalive(client, target_url, final_post_data, request_headers)
+                    else:
+                        # Normal non-streaming mode
+                        resp = await self._make_request(client, target_url, final_post_data, request_headers)
+                        return self._handle_non_streaming_response(resp)
+        except httpx.RequestError as e:
             logging.error(f"Request to Google API failed after retries: {str(e)}")
             return Response(
                 content=json.dumps({"error": {"message": f"Request failed after retries: {str(e)}"}}),
@@ -131,31 +135,15 @@ class GoogleApiClient:
                 media_type="application/json"
             )
 
-    def _handle_nonstream_keepalive(self, target_url, final_post_data, request_headers) -> StreamingResponse:
+    async def _handle_nonstream_keepalive(self, client: httpx.AsyncClient, target_url, final_post_data, request_headers) -> StreamingResponse:
         """Handle non-streaming request with keepalive: send newlines while making API request."""
         from .config import NONSTREAM_KEEPALIVE_INTERVAL
         keepalive_interval = NONSTREAM_KEEPALIVE_INTERVAL
         
         async def keepalive_generator():
             try:
-                # Start API request concurrently in a thread pool to avoid blocking
-                async def make_api_request():
-                    """Make the actual API request."""
-                    try:
-                        # Run the synchronous _make_request in a thread pool
-                        loop = asyncio.get_event_loop()
-                        resp = await loop.run_in_executor(
-                            None, 
-                            self._make_request, 
-                            target_url, final_post_data, request_headers, False
-                        )
-                        return resp
-                    except Exception as e:
-                        logging.error(f"API request failed: {str(e)}")
-                        raise
-                
                 # Start API request
-                api_task = asyncio.create_task(make_api_request())
+                api_task = asyncio.create_task(self._make_request(client, target_url, final_post_data, request_headers, False))
                 
                 # Send keepalive messages while waiting for API response
                 keepalive_counter = 0
@@ -274,28 +262,12 @@ class GoogleApiClient:
             }
         )
 
-    def _handle_pseudo_streaming(self, target_url, final_post_data, request_headers) -> StreamingResponse:
+    async def _handle_pseudo_streaming(self, client: httpx.AsyncClient, target_url, final_post_data, request_headers) -> StreamingResponse:
         """Handle pseudo-streaming: send heartbeats while making API request, then format response as SSE chunks."""
         async def pseudo_stream_generator():
             try:
-                # Start API request concurrently in a thread pool to avoid blocking
-                async def make_api_request():
-                    """Make the actual API request."""
-                    try:
-                        # Run the synchronous _make_request in a thread pool
-                        loop = asyncio.get_event_loop()
-                        resp = await loop.run_in_executor(
-                            None, 
-                            self._make_request, 
-                            target_url, final_post_data, request_headers, False
-                        )
-                        return resp
-                    except Exception as e:
-                        logging.error(f"API request failed: {str(e)}")
-                        raise
-                
                 # Start API request
-                api_task = asyncio.create_task(make_api_request())
+                api_task = asyncio.create_task(self._make_request(client, target_url, final_post_data, request_headers, False))
                 
                 # Send heartbeats while waiting for API response
                 last_heartbeat_time = time.time()
@@ -524,7 +496,7 @@ class GoogleApiClient:
         )
 
 
-    def _handle_streaming_response(self, resp) -> StreamingResponse:
+    async def _handle_streaming_response(self, resp: httpx.Response) -> StreamingResponse:
         """Handle streaming response from Google API."""
         
         if resp.status_code != 200:
@@ -566,10 +538,8 @@ class GoogleApiClient:
         
         async def stream_generator():
             try:
-                with resp:
-                    # Standard streaming behavior
-                    for chunk in resp.iter_lines():
-                        if chunk:
+                async for chunk in resp.aiter_lines():
+                    if chunk:
                             if not isinstance(chunk, str):
                                 chunk = chunk.decode('utf-8', "ignore")
                                 
@@ -591,7 +561,7 @@ class GoogleApiClient:
                                 except json.JSONDecodeError:
                                     continue
                     
-            except requests.exceptions.RequestException as e:
+            except httpx.RequestError as e:
                 logging.error(f"Streaming request failed: {str(e)}")
                 error_response = {
                     "error": {
@@ -628,7 +598,7 @@ class GoogleApiClient:
             headers=response_headers
         )
 
-    def _handle_non_streaming_response(self, resp) -> Response:
+    def _handle_non_streaming_response(self, resp: httpx.Response) -> Response:
         """Handle non-streaming response from Google API."""
         if resp.status_code == 200:
             try:

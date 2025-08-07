@@ -40,23 +40,23 @@ def get_client_metadata(creds, project_id=None):
         "duetProject": project_id,
     }
 
-import time
-import requests
+import asyncio
+import httpx
 from functools import wraps
 
 def retry_api_call(retries=3, delay=1):
     """
-    A decorator to retry a function call if it raises a requests.exceptions.RequestException.
+    A decorator to retry an async function call if it raises an httpx.RequestError.
     """
     def decorator(func):
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             for attempt in range(retries):
                 try:
-                    return func(*args, **kwargs)
-                except requests.exceptions.RequestException as e:
+                    return await func(*args, **kwargs)
+                except httpx.RequestError as e:
                     if attempt < retries - 1:
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                         continue
                     else:
                         raise
